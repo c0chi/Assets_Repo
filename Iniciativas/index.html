@@ -143,7 +143,7 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
 <body>
 <header class="intro"><div class="wrap">
   <h1>¿Qué priorizamos en Riesgos para 2027?</h1>
-  <p>Votá la prioridad de cada iniciativa. Tus votos se guardan en este navegador: cuando termines, descargá el CSV y compartilo con el equipo. Si falta algo, agregalo.</p>
+  <p>Votá la prioridad de cada iniciativa. Los resultados se actualizan para todo el equipo. Si falta algo, agregalo: la idea es armar el plan entre todos.</p>
   <div class="pulse" id="pulse"></div>
 </div></header>
 
@@ -153,11 +153,12 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
     <button type="button" data-view="resultados" aria-pressed="false">Resultados</button>
   </div>
   <div class="filters" id="filters" role="group" aria-label="Filtrar por frente"></div>
-  <button type="button" class="btn small" id="csvBtn">Descargar CSV</button>
+  <div class="facil" id="facil"></div>
+  <button type="button" class="btn small" id="csvBtn" hidden>Descargar CSV</button>
   <button type="button" class="btn primary" id="addBtn">Agregar iniciativa</button>
 </div></div>
 
-<main><div class="wrap" id="main"></div></main>
+<main><div class="wrap" id="main"><p class="empty">Cargando iniciativas…</p></div></main>
 
 <dialog id="dlg">
   <form class="dlg" id="form" method="dialog">
@@ -189,7 +190,9 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
   const ORDER = ["A","M","B"];
   const IMPULSORES = ["NIIF 9","Finanzas abiertas","Negocio","Riesgos","Cobranzas","Eficiencia"];
   const FRENTES_BASE = ["Datos y KPIs","Scores","Políticas","Automatización"];
-  const KEY = "riesgos2027-v1";
+  // URL de la implementación de Apps Script (termina en /exec)
+  const API = "https://script.google.com/macros/s/AKfycbwzwKUZhFx_deiYDCRPkoE9FcX2j3D1PW2TEP4LLv1STovlQ7JI_n8SkVxWRMcj_-o_7Q/exec";
+  const POLL_MS = 8000;
   const SEED = [
     ["Datos y KPIs","Seguimiento y mejora del trade-off entre tasa de aprobación y mora. Búsqueda de oportunidades en la política para mejorar la colocación de TC y préstamos, incorporando pérdida esperada y rentabilidad ajustada por riesgo.",[]],
     ["Datos y KPIs","Monitorear métricas asociadas a la política y procesos de alta y la calidad crediticia de la cartera originada.",[]],
@@ -209,7 +212,11 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
     ["Automatización","Integrar la gestión de consentimiento en los journeys del banco, asegurando trazabilidad y cumplimiento regulatorio (open banking).",["Finanzas abiertas"]]
   ].map(([frente,texto,impulsores],i)=>({id:"i"+(i+1),frente,texto,impulsores,origen:"inicial",orden:i+1}));
 
-  const st = { items:[], myVotes:{}, agreed:{}, view:"votar", frente:"Todos", editingId:null };
+  const st = {
+    status:"loading", items:SEED, added:[], votes:{}, voters:0, agreed:{}, hide:false,
+    uid:null, clave:"", canEdit:false, view:"votar", frente:"Todos", editingId:null
+  };
+  let pending=0, mine={};
 
   const $ = (s,el=document)=>el.querySelector(s);
   const esc = s => String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -219,22 +226,56 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
     document.body.appendChild(t); setTimeout(()=>t.remove(),3800);
   }
 
-  // ---------- storage (solo este navegador) ----------
-  function load(){
-    let saved=null;
-    try{ saved=JSON.parse(localStorage.getItem(KEY)||"null"); }catch(e){}
-    st.items = saved && Array.isArray(saved.items) ? saved.items : SEED.map(i=>Object.assign({},i));
-    st.myVotes = (saved && saved.votos) || {};
-    st.agreed = (saved && saved.acuerdos) || {};
+  // ---------- API (Google Sheet vía Apps Script) ----------
+  async function api(accion, data){
+    // text/plain evita el preflight CORS, que Apps Script no responde
+    const r = await fetch(API, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"},
+      body:JSON.stringify(Object.assign({accion, uid:st.uid, clave:st.clave}, data||{}))});
+    const j = await r.json();
+    if(!j.ok) throw Object.assign(new Error(j.error), {code:j.error});
+    apply(j.estado);
+    return j;
   }
-  function save(){
-    try{ localStorage.setItem(KEY, JSON.stringify({items:st.items, votos:st.myVotes, acuerdos:st.agreed})); }
-    catch(e){ toast("No se pudo guardar en este navegador. Descargá el CSV antes de cerrar."); }
+  function apply(e){
+    st.added = e.iniciativas.map(i=>Object.assign(i,{origen:"taller"}));
+    st.items = SEED.concat(st.added.sort((a,b)=>a.orden-b.orden));
+    st.votes = e.votos;
+    if(pending) st.votes[st.uid] = Object.assign({}, mine);
+    else mine = Object.assign({}, st.votes[st.uid]||{});
+    st.voters = e.votantes; st.agreed = e.acuerdos; st.hide = e.ocultos; st.canEdit = e.facilitador;
+    st.status = "ready"; render();
+  }
+  async function refresh(){
+    if(document.hidden || pending) return;
+    try{ await api("estado"); }
+    catch(e){ if(st.status!=="ready"){ st.status="error"; render(); } }
+  }
+
+  function storage(k, v){
+    try{ if(v===undefined) return localStorage.getItem(k); if(v===null) localStorage.removeItem(k); else localStorage.setItem(k,v); }catch(e){}
+    return null;
+  }
+  function identity(){
+    let uid = storage("riesgos2027-uid");
+    if(!uid){
+      uid = (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,12));
+      storage("riesgos2027-uid", uid);
+    }
+    st.uid = uid;
+    // Modo facilitador: abrir la página con ?facilitador=CLAVE una vez; la clave queda en este navegador
+    const q = new URLSearchParams(location.search);
+    if(q.has("facilitador")){
+      storage("riesgos2027-clave", q.get("facilitador"));
+      q.delete("facilitador");
+      history.replaceState(null, "", location.pathname + (q.toString() ? "?"+q : "") + location.hash);
+    }
+    st.clave = storage("riesgos2027-clave") || "";
   }
 
   // ---------- derived ----------
   function tally(id){
-    const c={A:0,M:0,B:0}; const p=st.myVotes[id]; if(c[p]!==undefined) c[p]++;
+    const c={A:0,M:0,B:0};
+    for(const uid in st.votes){ const p=(st.votes[uid]||{})[id]; if(c[p]!==undefined) c[p]++; }
     const n=c.A+c.M+c.B;
     const avg = n ? (c.A*3+c.M*2+c.B*1)/n : 0;
     return {c,n,avg};
@@ -244,22 +285,26 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
     st.items.forEach(i=>{ if(i.frente && !set.includes(i.frente)) set.push(i.frente); });
     return set;
   }
+  function showResults(){ return !st.hide || st.canEdit; }
+  function canDelete(it){ return it.origen==="taller" && (st.canEdit || it.mia); }
 
   // ---------- render ----------
   function render(){
     const active=document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.fk : null;
-    renderPulse(); renderFilters(); renderMain();
+    renderPulse(); renderFilters(); renderFacil(); renderMain();
     document.querySelectorAll(".seg button").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.view===st.view)));
-    $("#csvBtn").disabled = !st.items.length;
+    $("#addBtn").disabled = st.status!=="ready";
+    $("#csvBtn").hidden = st.status!=="ready" || !showResults();
     if(active){ const el=document.querySelector('[data-fk="'+CSS.escape(active)+'"]'); if(el) el.focus(); }
   }
 
   function renderPulse(){
-    const n=st.items.length, mine=Object.keys(st.myVotes).filter(k=>st.items.some(i=>i.id===k)).length;
+    const n=st.items.length, v=st.voters, own=Object.keys(mine).filter(k=>st.items.some(i=>i.id===k)).length;
     const agreed=Object.keys(st.agreed).filter(k=>st.items.some(i=>i.id===k)).length;
-    $("#pulse").innerHTML =
+    $("#pulse").innerHTML = st.status!=="ready" ? "" :
       '<div><strong>'+n+'</strong><span>iniciativas</span></div>'+
-      '<div><strong>'+mine+' de '+n+'</strong><span>tus votos</span></div>'+
+      '<div><strong>'+v+'</strong><span>'+(v===1?"persona votó":"personas votaron")+'</span></div>'+
+      '<div><strong>'+own+' de '+n+'</strong><span>tus votos</span></div>'+
       '<div><strong>'+agreed+'</strong><span>prioridades acordadas</span></div>';
   }
 
@@ -270,12 +315,19 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
     $("#frentesList").innerHTML = frentes().map(f=>'<option value="'+esc(f)+'">').join("");
   }
 
+  function renderFacil(){
+    const el=$("#facil");
+    if(!st.canEdit || st.status!=="ready"){ el.innerHTML=""; return; }
+    el.innerHTML='<label title="Los participantes no ven los resultados hasta que los muestres"><input type="checkbox" id="hideChk" data-fk="hide" '+(st.hide?"checked":"")+'> Ocultar resultados al equipo</label>';
+  }
+
   function voteButtons(it){
-    const mine=st.myVotes[it.id];
+    const own=mine[it.id];
     return '<div class="vote" role="group" aria-label="Tu voto para esta iniciativa">'+ORDER.map(p=>
-      '<button type="button" data-fk="v:'+esc(it.id)+':'+p+'" data-vote="'+esc(it.id)+'" data-p="'+p+'" aria-pressed="'+(mine===p)+'">'+P[p].label+'</button>').join("")+'</div>';
+      '<button type="button" data-fk="v:'+esc(it.id)+':'+p+'" data-vote="'+esc(it.id)+'" data-p="'+p+'" aria-pressed="'+(own===p)+'">'+P[p].label+'</button>').join("")+'</div>';
   }
   function distBlock(it, withAvg){
+    if(!showResults()) return '<div class="dist"><small>Resultados ocultos por ahora</small></div>';
     const t=tally(it.id);
     const pct=p=> t.n? (t.c[p]/t.n*100).toFixed(1):0;
     const label = t.n ? (t.c.A+" alta, "+t.c.M+" media, "+t.c.B+" baja") : "Sin votos todavía";
@@ -284,20 +336,24 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
   }
   function agreedBlock(it){
     const a=st.agreed[it.id];
-    {
+    if(st.canEdit){
       return '<div class="agreed"><label for="ag-'+esc(it.id)+'">Acordada</label><select id="ag-'+esc(it.id)+'" data-fk="ag:'+esc(it.id)+'" data-agree="'+esc(it.id)+'"><option value="">Sin definir</option>'+
         ORDER.map(p=>'<option value="'+p+'" '+(a===p?"selected":"")+'>'+P[p].label+'</option>').join("")+'</select></div>';
     }
+    return a ? '<div class="agreed">Acordada <span class="pill '+a+'">'+P[a].label+'</span></div>' : '';
   }
   function meta(it, withFrente){
     const tags=(it.impulsores||[]).map(t=>'<span class="tag'+(t==="NIIF 9"?" niif":"")+'">'+esc(t)+'</span>').join("");
-    const src = it.origen==="taller" ? '<span class="src">Agregada por vos</span>' : '';
-    const acts = it.origen==="taller" ? '<span class="actions"><button type="button" class="link" data-fk="e:'+esc(it.id)+'" data-edit="'+esc(it.id)+'">Editar</button><button type="button" class="link" data-fk="d:'+esc(it.id)+'" data-del="'+esc(it.id)+'">Eliminar</button></span>' : '';
+    const src = it.origen==="taller" ? '<span class="src">'+(it.mia?"Agregada por vos":"Sumada en el taller")+'</span>' : '';
+    const acts = canDelete(it) ? '<span class="actions"><button type="button" class="link" data-fk="e:'+esc(it.id)+'" data-edit="'+esc(it.id)+'">Editar</button><button type="button" class="link" data-fk="d:'+esc(it.id)+'" data-del="'+esc(it.id)+'">Eliminar</button></span>' : '';
     return '<div class="meta">'+tags+src+acts+'</div>';
   }
 
   function renderMain(){
     const m=$("#main");
+    if(st.status==="nocfg"){ m.innerHTML='<p class="empty">Falta configurar la URL de Apps Script en la página.</p>'; return; }
+    if(st.status==="error"){ m.innerHTML='<p class="empty">No se pudieron cargar los votos. Recargá la página para volver a intentar.</p>'; return; }
+    if(st.status!=="ready"){ m.innerHTML='<p class="empty">Cargando iniciativas…</p>'; return; }
     const note="";
 
     const items = st.items.filter(i=>st.frente==="Todos"||i.frente===st.frente);
@@ -312,17 +368,31 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
           '</div></section>';
       }).join("");
     } else {
+      if(!showResults()){ m.innerHTML = note+'<div class="hidden-box">El facilitador va a mostrar los resultados cuando termine la votación.</div>'; return; }
       const ranked = items.map(it=>({it,t:tally(it.id)})).sort((a,b)=>(b.t.avg-a.t.avg)||(b.t.n-a.t.n)||(a.it.orden||0)-(b.it.orden||0));
-      m.innerHTML = note + '<section class="frente rank"><h2>Ranking según tus votos<span class="count">Alta vale 3, Media 2 y Baja 1</span></h2><div class="list">'+
+      m.innerHTML = note + '<section class="frente rank"><h2>Ranking por voto del equipo<span class="count">Alta vale 3, Media 2 y Baja 1</span></h2><div class="list">'+
         ranked.map((r,i)=>'<article class="item"><span class="pos">'+(i+1)+'</span><div><div class="fr">'+esc(r.it.frente)+'</div><p class="txt">'+esc(r.it.texto)+'</p>'+meta(r.it)+'</div>'+distBlock(r.it,true)+agreedBlock(r.it)+'</article>').join("")+
         '</div></section>';
     }
   }
 
   // ---------- writes ----------
-  function vote(id,p){
-    if(st.myVotes[id]===p) delete st.myVotes[id]; else st.myVotes[id]=p;
-    save(); render();
+  async function vote(id,p){
+    if(mine[id]===p) delete mine[id]; else mine[id]=p;
+    st.votes[st.uid]=Object.assign({},mine); render();
+    pending++;
+    try{ await api("votar",{item:id, p:mine[id]||""}); }
+    catch(e){ toast("Tu voto no se guardó. Probá de nuevo en unos segundos."); pending--; pending||refresh(); return; }
+    pending--;
+  }
+  async function setAgreed(id,p){
+    if(p) st.agreed[id]=p; else delete st.agreed[id];
+    render();
+    try{ await api("acordar",{item:id, p}); }catch(e){ toast("No se pudo guardar la prioridad acordada."); refresh(); }
+  }
+  async function setHide(v){
+    st.hide=v; render();
+    try{ await api("ocultar",{valor:v}); }catch(e){ toast("No se pudo cambiar la visibilidad de resultados."); refresh(); }
   }
 
   // ---------- dialog ----------
@@ -345,28 +415,27 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
     const frente=$("#fFrente").value.trim(), texto=$("#fTexto").value.trim();
     const impulsores=[...document.querySelectorAll("#fImp input:checked")].map(i=>i.value);
     if(!frente||!texto){ $("#fErr").textContent="Completá el frente y la iniciativa."; return; }
-    if(st.editingId){
-      Object.assign(st.items.find(i=>i.id===st.editingId)||{}, {frente,texto,impulsores});
-      toast("Cambios guardados.");
-    }else{
-      const maxO = st.items.reduce((m,i)=>Math.max(m,i.orden||0),0);
-      st.items.push({id:"t"+Date.now(),frente,texto,impulsores,origen:"taller",orden:maxO+1});
-      toast("Iniciativa agregada.");
-    }
-    save(); dlg.close(); render();
+    $("#saveBtn").disabled=true;
+    try{
+      if(st.editingId){ await api("editar",{id:st.editingId,frente,texto,impulsores}); toast("Cambios guardados."); }
+      else{ await api("agregar",{frente,texto,impulsores}); toast("Iniciativa agregada."); }
+      dlg.close();
+    }catch(e){
+      $("#fErr").textContent = e.code==="permiso" ? "Solo quien la agregó o el facilitador puede editarla." : e.code==="limite" ? "Se alcanzó el límite de iniciativas." : "No se pudo guardar. Probá de nuevo.";
+    }finally{ $("#saveBtn").disabled=false; }
   });
 
-  function del(id){
+  async function del(id){
     if(!st.items.some(i=>i.id===id)) return;
-    if(!confirm("¿Eliminar esta iniciativa? Se pierde también tu voto.")) return;
-    st.items=st.items.filter(i=>i.id!==id); delete st.myVotes[id]; delete st.agreed[id];
-    save(); render(); toast("Iniciativa eliminada.");
+    if(!confirm("¿Eliminar esta iniciativa? Se pierden también sus votos.")) return;
+    try{ await api("borrar",{id}); toast("Iniciativa eliminada."); }
+    catch(e){ toast("No se pudo eliminar la iniciativa."); }
   }
 
   function csv(){
     const q=s=>'"'+String(s==null?"":s).replace(/"/g,'""')+'"';
-    const rows=[["Frente","Iniciativa","Impulsor","Mi voto","Prioridad acordada","Origen"]];
-    st.items.forEach(it=>{ const v=st.myVotes[it.id]; rows.push([it.frente,it.texto,(it.impulsores||[]).join(" + "),v?P[v].label:"",st.agreed[it.id]?P[st.agreed[it.id]].label:"",it.origen==="taller"?"Agregada":"Propuesta inicial"]); });
+    const rows=[["Frente","Iniciativa","Impulsor","Votos Alta","Votos Media","Votos Baja","Promedio (1 a 3)","Prioridad acordada","Origen"]];
+    st.items.forEach(it=>{ const t=tally(it.id); rows.push([it.frente,it.texto,(it.impulsores||[]).join(" + "),t.c.A,t.c.M,t.c.B,t.n?t.avg.toFixed(2).replace(".",","):"",st.agreed[it.id]?P[st.agreed[it.id]].label:"",it.origen==="taller"?"Taller":"Propuesta inicial"]); });
     const data="\ufeff"+rows.map(r=>r.map(q).join(";")).join("\r\n");
     const a=document.createElement("a");
     a.href=URL.createObjectURL(new Blob([data],{type:"text/csv;charset=utf-8"}));
@@ -387,11 +456,18 @@ dialog::backdrop{background:rgba(15,21,32,.45)}
   });
   document.addEventListener("change",(e)=>{
     const t=e.target;
-    if(t.dataset && t.dataset.agree){ const id=t.dataset.agree; if(t.value) st.agreed[id]=t.value; else delete st.agreed[id]; save(); render(); }
+    if(t.dataset && t.dataset.agree){ setAgreed(t.dataset.agree, t.value); }
+    if(t.id==="hideChk"){ setHide(t.checked); }
   });
 
   // ---------- init ----------
-  load(); render();
+  identity(); render();
+  if(!/^https:\/\/script\.google\.com\//.test(API)){ st.status="nocfg"; render(); }
+  else{
+    refresh();
+    setInterval(refresh, POLL_MS);
+    document.addEventListener("visibilitychange", refresh);
+  }
 })();
 </script>
 </body>
